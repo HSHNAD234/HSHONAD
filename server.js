@@ -17,6 +17,7 @@ const SUPABASE_SECRET_KEY = (
 ).trim();
 const STEAM_APP_ID = (process.env.STEAM_APP_ID || '2334220').trim();
 const hasSteamApiKey = Boolean((process.env.STEAM_API_KEY || '').trim());
+const DISCORD_AUTH_ME_URL = (process.env.DISCORD_AUTH_ME_URL || '').trim();
 
 let supabase;
 
@@ -48,7 +49,7 @@ app.get('/live/checkversion', async (_req, res) => {
     try {
         const { data, error } = await db()
             .from('server_settings')
-            .select('correct_version,server_version,server_dev_version,is_online,is_dev_online')
+            .select('correct_version,server_version,server_dev_version,is_online,is_dev_online,closed_until')
             .eq('id', 'main')
             .maybeSingle();
         if (error) throw error;
@@ -62,6 +63,7 @@ app.get('/live/checkversion', async (_req, res) => {
             ServerDevVersion: data?.server_dev_version ?? '0.0.0.1',
             IsOnline: data?.is_online ?? true,
             IsDevOnline: data?.is_dev_online ?? true,
+            ClosedUntil: data?.closed_until ?? null,
             serverTime: Date.now()
         });
     } catch (error) {
@@ -72,6 +74,54 @@ app.get('/live/checkversion', async (_req, res) => {
             status: false,
             serverTime: Date.now()
         });
+    }
+});
+
+// Validate the short-lived Discord OAuth token with the existing auth service;
+// never accept a Discord ID supplied directly by the Launcher.
+app.get('/live/player/ban-status', async (req, res) => {
+    const authorization = String(req.get('authorization') || '');
+    const match = authorization.match(/^Bearer\s+(.+)$/i);
+    if (!match) return res.status(401).json({ message: 'Authentication required' });
+    if (!DISCORD_AUTH_ME_URL) {
+        return res.status(503).json({ message: 'Ban status authentication is not configured' });
+    }
+    try {
+        const authUrl = new URL(DISCORD_AUTH_ME_URL);
+        if (authUrl.protocol !== 'https:') throw new Error('Auth verification URL must use HTTPS');
+        const authResponse = await fetch(authUrl, {
+            headers: { Authorization: `Bearer ${match[1]}` },
+            signal: AbortSignal.timeout(10000)
+        });
+        if (!authResponse.ok) return res.status(401).json({ message: 'Authentication failed' });
+        const identity = await authResponse.json();
+        const discordId = String(identity?.discordId || '').trim();
+        if (identity?.authenticated !== true || !/^[0-9]{17,20}$/.test(discordId)) {
+            return res.status(401).json({ message: 'Authentication failed' });
+        }
+
+        const { data: player, error } = await db().from('players')
+            .select('steam_id,is_banned,banned_until,ban_reason')
+            .eq('discord_id', discordId).eq('is_whitelisted', true).limit(1).maybeSingle();
+        if (error) throw error;
+        if (!player) return res.json({ found: false, isBanned: false });
+
+        let isBanned = player.is_banned;
+        let bannedUntil = player.banned_until;
+        let banReason = player.ban_reason;
+        if (isBanned && bannedUntil && new Date(bannedUntil).getTime() <= Date.now()) {
+            const { error: updateError } = await db().from('players').update({
+                is_banned: false, banned_until: null, ban_reason: null, updated_at: new Date().toISOString()
+            }).eq('steam_id', player.steam_id);
+            if (updateError) throw updateError;
+            isBanned = false;
+            bannedUntil = null;
+            banReason = null;
+        }
+        return res.json({ found: true, isBanned, bannedUntil, banReason });
+    } catch (error) {
+        console.error('[player/ban-status] Check failed:', error.message);
+        return res.status(503).json({ message: 'Could not verify player ban status' });
     }
 });
 
