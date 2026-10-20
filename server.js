@@ -45,7 +45,7 @@ app.get('/live/checkversion', async (_req, res) => {
     try {
         const { data, error } = await db()
             .from('server_settings')
-            .select('correct_version,server_version,server_dev_version,is_online,closed_until')
+            .select('correct_version,server_version,server_dev_version,is_online,is_dev_online,closed_until')
             .eq('id', 'main')
             .maybeSingle();
         if (error) throw error;
@@ -58,6 +58,8 @@ app.get('/live/checkversion', async (_req, res) => {
             serverVersion: data?.server_version ?? '1.0.6.0',
             ServerDevVersion: data?.server_dev_version ?? '0.0.0.1',
             IsOnline: data?.is_online ?? true,
+            IsDevOnline: data?.is_dev_online ?? false,
+            __v: 0,
             ClosedUntil: data?.closed_until ?? null,
             serverTime: Date.now()
         });
