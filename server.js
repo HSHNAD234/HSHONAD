@@ -2,6 +2,7 @@ require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
@@ -18,6 +19,7 @@ const SUPABASE_SECRET_KEY = (
 const STEAM_APP_ID = (process.env.STEAM_APP_ID || '2334220').trim();
 const hasSteamApiKey = Boolean((process.env.STEAM_API_KEY || '').trim());
 const DISCORD_AUTH_ME_URL = (process.env.DISCORD_AUTH_ME_URL || '').trim();
+const WHITELIST_WEBHOOK_SECRET = (process.env.WHITELIST_WEBHOOK_SECRET || '').trim();
 
 let supabase;
 
@@ -96,6 +98,62 @@ async function verifyDiscordBearer(req) {
     }
     return discordId;
 }
+
+// Server-to-server endpoint for the whitelist website. Call this only after
+// the website has approved an application; never expose this secret in browser JS.
+app.post('/api/whitelist/approve', async (req, res) => {
+    try {
+        if (!WHITELIST_WEBHOOK_SECRET) {
+            return res.status(503).json({ error: 'Whitelist integration is not configured' });
+        }
+        const suppliedSecret = String(req.get('x-whitelist-secret') || '');
+        const expected = Buffer.from(WHITELIST_WEBHOOK_SECRET);
+        const supplied = Buffer.from(suppliedSecret);
+        if (expected.length !== supplied.length || !crypto.timingSafeEqual(expected, supplied)) {
+            return res.status(401).json({ error: 'Unauthorized' });
+        }
+
+        const steamId = String(req.body?.steamId || '').trim();
+        const discordId = String(req.body?.discordId || '').trim();
+        const displayName = String(req.body?.displayName || '').trim();
+        const discordTag = String(req.body?.discordTag || '').trim();
+        if (!/^[0-9]{17}$/.test(steamId)) return res.status(400).json({ error: 'steamId must be 17 digits' });
+        if (!/^[0-9]{17,20}$/.test(discordId)) return res.status(400).json({ error: 'discordId is invalid' });
+        if (displayName.length < 1 || displayName.length > 64) return res.status(400).json({ error: 'displayName must be 1–64 characters' });
+        if (discordTag.length > 100) return res.status(400).json({ error: 'discordTag is too long' });
+
+        // Prevent accidental reassignment when the same Discord account is
+        // already linked to a different Steam account (or vice versa).
+        const { data: discordOwner, error: discordLookupError } = await db().from('players')
+            .select('steam_id').eq('discord_id', discordId).limit(1).maybeSingle();
+        if (discordLookupError) throw discordLookupError;
+        if (discordOwner && discordOwner.steam_id !== steamId) {
+            return res.status(409).json({ error: 'Discord account is already linked to another Steam account' });
+        }
+        const { data: steamOwner, error: steamLookupError } = await db().from('players')
+            .select('discord_id').eq('steam_id', steamId).maybeSingle();
+        if (steamLookupError) throw steamLookupError;
+        if (steamOwner?.discord_id && steamOwner.discord_id !== discordId) {
+            return res.status(409).json({ error: 'Steam account is already linked to another Discord account' });
+        }
+
+        const now = new Date().toISOString();
+        const { error } = await db().from('players').upsert({
+            steam_id: steamId,
+            display_name: displayName,
+            discord_id: discordId,
+            discord_tag: discordTag || null,
+            whitelisted_at: now,
+            is_whitelisted: true,
+            updated_at: now
+        }, { onConflict: 'steam_id' });
+        if (error) throw error;
+        return res.status(200).json({ ok: true, steamId, discordId, isWhitelisted: true });
+    } catch (error) {
+        console.error('[whitelist/approve] Failed:', error.message);
+        return res.status(500).json({ error: 'Could not save approved whitelist entry' });
+    }
+});
 
 app.get('/live/player/ban-status', async (req, res) => {
     try {
@@ -223,7 +281,7 @@ async function startServer() {
         console.log('[Supabase] Connected.');
         console.log(`[Steam] App ID configured: ${STEAM_APP_ID}`);
         console.log(`[Steam] API key configured: ${hasSteamApiKey}`);
-        console.log('[Notice] Player data requires verified Steam authentication middleware.');
+        console.log(`[Whitelist] Website integration configured: ${Boolean(WHITELIST_WEBHOOK_SECRET)}`);
         app.listen(PORT, '0.0.0.0', () => console.log(`[Server] Backend running on port ${PORT}`));
     } catch (error) {
         console.error('[Supabase] Connection failed:', error.message);
