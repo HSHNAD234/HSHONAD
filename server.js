@@ -30,26 +30,11 @@ function db() {
 // Player API
 // ==========================================
 
-// Fail closed until a real, game-supported Steam ticket verifier is connected.
-// The original source referenced req.user but did not contain authentication
-// middleware that sets it. Do not trust a Steam ID supplied by an arbitrary client.
-function requireVerifiedSteamUser(req, res, next) {
-    const steamId = req.user?.steamId;
-    if (typeof steamId !== 'string' || !/^\d{17}$/.test(steamId)) {
-        return res.status(401).json({
-            code: 401,
-            message: 'Steam authentication required',
-            status: false
-        });
-    }
-    next();
-}
-
 app.get('/live/checkversion', async (_req, res) => {
     try {
         const { data, error } = await db()
             .from('server_settings')
-            .select('correct_version,server_version,server_dev_version,is_online,is_dev_online,closed_until')
+            .select('correct_version,server_version,server_dev_version,is_online,closed_until')
             .eq('id', 'main')
             .maybeSingle();
         if (error) throw error;
@@ -62,7 +47,6 @@ app.get('/live/checkversion', async (_req, res) => {
             serverVersion: data?.server_version ?? '1.0.6.0',
             ServerDevVersion: data?.server_dev_version ?? '0.0.0.1',
             IsOnline: data?.is_online ?? true,
-            IsDevOnline: data?.is_dev_online ?? true,
             ClosedUntil: data?.closed_until ?? null,
             serverTime: Date.now()
         });
@@ -77,34 +61,50 @@ app.get('/live/checkversion', async (_req, res) => {
     }
 });
 
-// Validate the short-lived Discord OAuth token with the existing auth service;
-// never accept a Discord ID supplied directly by the Launcher.
-app.get('/live/player/ban-status', async (req, res) => {
+// Resolve the Discord identity from the short-lived OAuth token. Never trust
+// a Discord ID supplied as a query parameter or request body.
+async function verifyDiscordBearer(req) {
     const authorization = String(req.get('authorization') || '');
     const match = authorization.match(/^Bearer\s+(.+)$/i);
-    if (!match) return res.status(401).json({ message: 'Authentication required' });
-    if (!DISCORD_AUTH_ME_URL) {
-        return res.status(503).json({ message: 'Ban status authentication is not configured' });
+    if (!match) {
+        const error = new Error('Authentication required');
+        error.statusCode = 401;
+        throw error;
     }
-    try {
-        const authUrl = new URL(DISCORD_AUTH_ME_URL);
-        if (authUrl.protocol !== 'https:') throw new Error('Auth verification URL must use HTTPS');
-        const authResponse = await fetch(authUrl, {
-            headers: { Authorization: `Bearer ${match[1]}` },
-            signal: AbortSignal.timeout(10000)
-        });
-        if (!authResponse.ok) return res.status(401).json({ message: 'Authentication failed' });
-        const identity = await authResponse.json();
-        const discordId = String(identity?.discordId || '').trim();
-        if (identity?.authenticated !== true || !/^[0-9]{17,20}$/.test(discordId)) {
-            return res.status(401).json({ message: 'Authentication failed' });
-        }
+    if (!DISCORD_AUTH_ME_URL) {
+        const error = new Error('Discord token verification is not configured');
+        error.statusCode = 503;
+        throw error;
+    }
+    const authUrl = new URL(DISCORD_AUTH_ME_URL);
+    if (authUrl.protocol !== 'https:') throw new Error('Auth verification URL must use HTTPS');
+    const authResponse = await fetch(authUrl, {
+        headers: { Authorization: `Bearer ${match[1]}` },
+        signal: AbortSignal.timeout(10000)
+    });
+    if (!authResponse.ok) {
+        const error = new Error('Authentication failed');
+        error.statusCode = 401;
+        throw error;
+    }
+    const identity = await authResponse.json();
+    const discordId = String(identity?.discordId || '').trim();
+    if (identity?.authenticated !== true || !/^[0-9]{17,20}$/.test(discordId)) {
+        const error = new Error('Authentication failed');
+        error.statusCode = 401;
+        throw error;
+    }
+    return discordId;
+}
 
+app.get('/live/player/ban-status', async (req, res) => {
+    try {
+        const discordId = await verifyDiscordBearer(req);
         const { data: player, error } = await db().from('players')
-            .select('steam_id,is_banned,banned_until,ban_reason')
-            .eq('discord_id', discordId).eq('is_whitelisted', true).limit(1).maybeSingle();
+            .select('steam_id,is_whitelisted,is_banned,banned_until,ban_reason')
+            .eq('discord_id', discordId).limit(1).maybeSingle();
         if (error) throw error;
-        if (!player) return res.json({ found: false, isBanned: false });
+        if (!player) return res.json({ found: false, isWhitelisted: false, isBanned: false });
 
         let isBanned = player.is_banned;
         let bannedUntil = player.banned_until;
@@ -118,38 +118,34 @@ app.get('/live/player/ban-status', async (req, res) => {
             bannedUntil = null;
             banReason = null;
         }
-        return res.json({ found: true, isBanned, bannedUntil, banReason });
+        return res.json({
+            found: true,
+            isWhitelisted: player.is_whitelisted === true,
+            isBanned,
+            bannedUntil,
+            banReason
+        });
     } catch (error) {
         console.error('[player/ban-status] Check failed:', error.message);
-        return res.status(503).json({ message: 'Could not verify player ban status' });
+        return res.status(error.statusCode || 503).json({ message: error.message || 'Could not verify player ban status' });
     }
 });
 
-app.get('/live/player/getdata', requireVerifiedSteamUser, async (req, res) => {
-    const steamId = req.user.steamId;
+app.get('/live/player/getdata', async (req, res) => {
     try {
-        let { data: player, error } = await db()
+        const discordId = await verifyDiscordBearer(req);
+        const { data: player, error } = await db()
             .from('players')
-            .select('steam_id,display_name,level,experience,currency_gold,currency_gem')
-            .eq('steam_id', steamId)
+            .select('steam_id,display_name,is_whitelisted,is_banned,banned_until,level,experience,gold,gem')
+            .eq('discord_id', discordId)
+            .limit(1)
             .maybeSingle();
         if (error) throw error;
-
-        if (!player) {
-            const created = await db().from('players').insert({ steam_id: steamId })
-                .select('steam_id,display_name,level,experience,currency_gold,currency_gem')
-                .single();
-            if (created.error?.code === '23505') {
-                const retry = await db().from('players')
-                    .select('steam_id,display_name,level,experience,currency_gold,currency_gem')
-                    .eq('steam_id', steamId).single();
-                if (retry.error) throw retry.error;
-                player = retry.data;
-            } else {
-                if (created.error) throw created.error;
-                player = created.data;
-            }
-        }
+        if (!player) return res.status(404).json({ code: 404, message: 'Player not found', status: false });
+        if (player.is_whitelisted !== true)
+            return res.status(403).json({ code: 403, message: 'Player is not whitelisted', status: false });
+        if (player.is_banned && (!player.banned_until || new Date(player.banned_until).getTime() > Date.now()))
+            return res.status(403).json({ code: 403, message: 'Player is banned', status: false });
 
         return res.json({
             code: 0,
@@ -160,16 +156,16 @@ app.get('/live/player/getdata', requireVerifiedSteamUser, async (req, res) => {
                 level: player.level,
                 exp: player.experience,
                 currency: {
-                    gold: player.currency_gold,
-                    gem: player.currency_gem
+                    gold: player.gold,
+                    gem: player.gem
                 }
             }
         });
     } catch (error) {
         console.error('[player/getdata] Supabase query failed:', error.message);
-        return res.status(500).json({
-            code: 500,
-            message: 'Unable to load player data',
+        return res.status(error.statusCode || 500).json({
+            code: error.statusCode || 500,
+            message: error.message || 'Unable to load player data',
             status: false
         });
     }
